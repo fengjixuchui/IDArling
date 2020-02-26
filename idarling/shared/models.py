@@ -15,8 +15,8 @@ from .packets import Default
 
 class Model(Default):
     """
-    A model is an object can be serialized and sent over the network, but that
-    can be saved into the SQL database used by the server.
+    A model is an object that can be serialized and sent over the network, but 
+    that can be saved into the SQL database used by the server.
     """
 
     def build(self, dct):
@@ -41,16 +41,30 @@ class Model(Default):
         return u"{}({})".format(self.__class__.__name__, attrs)
 
 
+class Group(Model):
+    """
+    IDBs are organized into groups, projects and databases. A group contains all
+    the files associated to a given topic, CVE, malware, etc. that we want to 
+    group together to ease differentiating from another research topic.
+    """
+
+    def __init__(self, name, date):
+        super(Group, self).__init__()
+        self.name = name
+        self.date = date
+
+
 class Project(Model):
     """
-    IDBs are organized into projects and databases. A project regroups
+    IDBs are organized into groups, projects and databases. A project regroups
     multiples revisions of an IDB. It has a name, the hash of the input file,
     the path to the input file, the type of the input file and the date of the
     database creation.
     """
 
-    def __init__(self, name, hash, file, type, date):
+    def __init__(self, group_name, name, hash, file, type, date):
         super(Project, self).__init__()
+        self.group_name = group_name
         self.name = name
         self.hash = hash
         self.file = file
@@ -60,13 +74,14 @@ class Project(Model):
 
 class Database(Model):
     """
-    IDBs are organized into projects and databases. A database corresponds to
+    IDBs are organized into groups, projects and databases. A database corresponds to
     a revision of an IDB. It has a project, a name, a date of creation, and a
     current tick (events) count.
     """
 
-    def __init__(self, project, name, date, tick=0):
+    def __init__(self, group_name, project, name, date, tick=0):
         super(Database, self).__init__()
+        self.group_name = group_name
         self.project = project
         self.name = name
         self.date = date

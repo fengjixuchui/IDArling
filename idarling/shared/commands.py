@@ -10,7 +10,7 @@
 
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
-from .models import Database, Project
+from .models import Group, Project, Database
 from .packets import (
     Command,
     Container,
@@ -21,11 +21,33 @@ from .packets import (
 )
 
 
+class ListGroups(ParentCommand):
+    __command__ = "list_groups"
+
+    class Query(IQuery, DefaultCommand):
+        pass
+
+    class Reply(IReply, Command):
+        def __init__(self, query, groups):
+            super(ListGroups.Reply, self).__init__(query)
+            self.groups = groups
+
+        def build_command(self, dct):
+            dct["groups"] = [group.build({}) for group in self.groups]
+
+        def parse_command(self, dct):
+            self.groups = [
+                Group.new(group) for group in dct["groups"]
+            ]
+
+
 class ListProjects(ParentCommand):
     __command__ = "list_projects"
 
     class Query(IQuery, DefaultCommand):
-        pass
+        def __init__(self, group):
+            super(ListProjects.Query, self).__init__()
+            self.group = group
 
     class Reply(IReply, Command):
         def __init__(self, query, projects):
@@ -45,8 +67,9 @@ class ListDatabases(ParentCommand):
     __command__ = "list_databases"
 
     class Query(IQuery, DefaultCommand):
-        def __init__(self, project):
+        def __init__(self, group, project):
             super(ListDatabases.Query, self).__init__()
+            self.group = group
             self.project = project
 
     class Reply(IReply, Command):
@@ -63,6 +86,24 @@ class ListDatabases(ParentCommand):
             self.databases = [
                 Database.new(database) for database in dct["databases"]
             ]
+
+
+class CreateGroup(ParentCommand):
+    __command__ = "create_group"
+
+    class Query(IQuery, Command):
+        def __init__(self, group):
+            super(CreateGroup.Query, self).__init__()
+            self.group = group
+
+        def build_command(self, dct):
+            self.group.build(dct["group"])
+
+        def parse_command(self, dct):
+            self.group = Group.new(dct["group"])
+
+    class Reply(IReply, Command):
+        pass
 
 
 class CreateProject(ParentCommand):
@@ -105,8 +146,9 @@ class UpdateFile(ParentCommand):
     __command__ = "update_file"
 
     class Query(IQuery, Container, DefaultCommand):
-        def __init__(self, project, database):
+        def __init__(self, group, project, database):
             super(UpdateFile.Query, self).__init__()
+            self.group = group
             self.project = project
             self.database = database
 
@@ -118,20 +160,47 @@ class DownloadFile(ParentCommand):
     __command__ = "download_file"
 
     class Query(IQuery, DefaultCommand):
-        def __init__(self, project, database):
+        def __init__(self, group, project, database):
             super(DownloadFile.Query, self).__init__()
+            self.group = group
             self.project = project
             self.database = database
 
     class Reply(IReply, Container, Command):
         pass
 
+class RenameProject(ParentCommand):
+    __command__ = "rename_project"
+
+    class Query(IQuery, DefaultCommand):
+        def __init__(self, group, old_name, new_name):
+            super(RenameProject.Query, self).__init__()
+            self.group = group
+            self.old_name = old_name
+            self.new_name = new_name
+
+    class Reply(IReply, Command):
+        def __init__(self, query, projects, renamed):
+            super(RenameProject.Reply, self).__init__(query)
+            self.projects = projects
+            self.renamed = renamed
+
+        def build_command(self, dct):
+            dct["renamed"] = self.renamed
+            dct["projects"] = [project.build({}) for project in self.projects]
+
+        def parse_command(self, dct):
+            self.renamed = dct["renamed"]
+            self.projects = [
+                Project.new(project) for project in dct["projects"]
+            ]
 
 class JoinSession(DefaultCommand):
     __command__ = "join_session"
 
-    def __init__(self, project, database, tick, name, color, ea, silent=True):
+    def __init__(self, group, project, database, tick, name, color, ea, silent=True):
         super(JoinSession, self).__init__()
+        self.group = group
         self.project = project
         self.database = database
         self.tick = tick

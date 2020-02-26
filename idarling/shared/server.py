@@ -14,16 +14,20 @@ import logging
 import os
 import socket
 import ssl
+import threading
 
 from .commands import (
-    CreateDatabase,
+    CreateGroup,
     CreateProject,
+    CreateDatabase,
     DownloadFile,
     InviteToLocation,
     JoinSession,
     LeaveSession,
-    ListDatabases,
+    ListGroups,
     ListProjects,
+    ListDatabases,
+    RenameProject,
     UpdateFile,
     UpdateLocation,
     UpdateUserColor,
@@ -43,12 +47,17 @@ class ServerClient(ClientSocket):
 
     def __init__(self, logger, parent=None):
         ClientSocket.__init__(self, logger, parent)
+        self._group = None
         self._project = None
         self._database = None
         self._name = None
         self._color = None
         self._ea = None
         self._handlers = {}
+
+    @property
+    def group(self):
+        return self._group
 
     @property
     def project(self):
@@ -75,12 +84,15 @@ class ServerClient(ClientSocket):
 
         # Setup command handlers
         self._handlers = {
+            ListGroups.Query: self._handle_list_groups,
             ListProjects.Query: self._handle_list_projects,
             ListDatabases.Query: self._handle_list_databases,
+            CreateGroup.Query: self._handle_create_group,
             CreateProject.Query: self._handle_create_project,
             CreateDatabase.Query: self._handle_create_database,
             UpdateFile.Query: self._handle_upload_file,
             DownloadFile.Query: self._handle_download_file,
+            RenameProject.Query: self._handle_rename_project,
             JoinSession: self._handle_join_session,
             LeaveSession: self._handle_leave_session,
             UpdateLocation: self._handle_update_location,
@@ -102,7 +114,7 @@ class ServerClient(ClientSocket):
     def disconnect(self, err=None, notify=True):
         # Notify other users that we disconnected
         self.parent().reject(self)
-        if self._project and self._database and notify:
+        if self._group and self._project and self._database and notify:
             self.parent().forward_users(self, LeaveSession(self.name, False))
         ClientSocket.disconnect(self, err)
         self._logger.info("Disconnected")
@@ -113,7 +125,7 @@ class ServerClient(ClientSocket):
             self._handlers[packet.__class__](packet)
 
         elif isinstance(packet, Event):
-            if not self._project or not self._database:
+            if not self._group or not self._project or not self._database:
                 self._logger.warning(
                     "Received a packet from an unsubscribed client"
                 )
@@ -121,7 +133,7 @@ class ServerClient(ClientSocket):
 
             # Check for de-synchronization
             tick = self.parent().storage.last_tick(
-                self._project, self._database
+                self._group, self._project, self._database
             )
             if tick >= packet.tick:
                 self._logger.warning("De-synchronization detected!")
@@ -137,7 +149,7 @@ class ServerClient(ClientSocket):
             if packet.tick and interval and packet.tick % interval == 0:
 
                 def file_downloaded(reply):
-                    file_name = "%s_%s.idb" % (self._project, self._database)
+                    file_name = "%s_%s_%s.idb" % (self._group, self._project, self._database)
                     file_path = self.parent().server_file(file_name)
 
                     # Write the file to disk
@@ -146,7 +158,7 @@ class ServerClient(ClientSocket):
                     self._logger.info("Auto-saved file %s" % file_name)
 
                 d = self.send_packet(
-                    DownloadFile.Query(self._project, self._database)
+                    DownloadFile.Query(self._group, self._project, self._database)
                 )
                 d.add_callback(file_downloaded)
                 d.add_errback(self._logger.exception)
@@ -154,21 +166,79 @@ class ServerClient(ClientSocket):
             return False
         return True
 
+    def _handle_rename_project(self, query):
+        self._logger.info("Got rename project request")
+        projects = self.parent().storage.select_projects(query.group)
+        for project in projects:
+            if project.name == query.new_name:
+                self._logger.error("Attempt to rename project to existing name")
+                return
+
+        # Grab the database lock. This basically means no other client can be
+        # connected for a rename to occur.
+        db_update_locked = False
+        for project in projects:
+            if project.name == query.old_name:
+                self.parent().client_lock.acquire()
+                # Only do the rename if we could lock the db. Otherwise we will
+                # mess with other clients.
+                db_update_locked = self.parent().db_update_lock.acquire(blocking=False)
+                self.parent().client_lock.release()
+                if db_update_locked:
+                    self.parent().storage.update_project_name(query.group, query.old_name, query.new_name)
+                    self.parent().storage.update_database_project(query.group, query.old_name, query.new_name)
+                    self.parent().storage.update_events_project(query.group, query.old_name, query.new_name)
+
+                    # We just changed the table entries so be sure to use new names 
+                    # for queries
+                    databases = self.parent().storage.select_databases(query.group, query.new_name)
+                    for database in databases:
+                        old_file_name = "%s_%s_%s.idb" % (query.group, query.old_name, database.name)
+                        new_file_name = "%s_%s_%s.idb" % (query.group, query.new_name, database.name)
+                        old_file_path = self.parent().server_file(old_file_name)
+                        new_file_path = self.parent().server_file(new_file_name)
+                        # If a rename happens before a file is uploaded, the 
+                        # idb won't exist
+                        if os.path.exists(old_file_path):
+                            self._logger.info("Renaming: %s to %s" % (old_file_path, new_file_name))
+                            os.rename(old_file_path, new_file_path)
+                        else:
+                            self._logger.warning("Skipping file rename due to non existing file: %s" % old_file_path)
+
+                    self.parent().db_update_lock.release()
+                else:
+                    self._logger.info("Skipping rename due to database lock")
+
+        # Resend an updated list of project names since it just changed
+        projects = self.parent().storage.select_projects(query.group)
+        self.send_packet(RenameProject.Reply(query, projects, db_update_locked))
+
+    def _handle_list_groups(self, query):
+        self._logger.info("Got list groups request")
+        groups = self.parent().storage.select_groups()
+        self.send_packet(ListGroups.Reply(query, groups))
+
     def _handle_list_projects(self, query):
-        projects = self.parent().storage.select_projects()
+        self._logger.info("Got list projects request")
+        projects = self.parent().storage.select_projects(query.group)
         self.send_packet(ListProjects.Reply(query, projects))
 
     def _handle_list_databases(self, query):
-        databases = self.parent().storage.select_databases(query.project)
+        self._logger.info("Got list databases request")
+        databases = self.parent().storage.select_databases(query.group, query.project)
         for database in databases:
-            database_info = database.project, database.name
-            file_name = "%s_%s.idb" % database_info
+            database_info = database.group_name, database.project, database.name
+            file_name = "%s_%s_%s.idb" % (database_info)
             file_path = self.parent().server_file(file_name)
             if os.path.isfile(file_path):
                 database.tick = self.parent().storage.last_tick(*database_info)
             else:
                 database.tick = -1
         self.send_packet(ListDatabases.Reply(query, databases))
+
+    def _handle_create_group(self, query):
+        self.parent().storage.insert_group(query.group)
+        self.send_packet(CreateGroup.Reply(query))
 
     def _handle_create_project(self, query):
         self.parent().storage.insert_project(query.project)
@@ -180,9 +250,9 @@ class ServerClient(ClientSocket):
 
     def _handle_upload_file(self, query):
         database = self.parent().storage.select_database(
-            query.project, query.database
+            query.group, query.project, query.database
         )
-        file_name = "%s_%s.idb" % (database.project, database.name)
+        file_name = "%s_%s_%s.idb" % (query.group, database.project, database.name)
         file_path = self.parent().server_file(file_name)
 
         # Write the file received to disk
@@ -193,9 +263,9 @@ class ServerClient(ClientSocket):
 
     def _handle_download_file(self, query):
         database = self.parent().storage.select_database(
-            query.project, query.database
+            query.group, query.project, query.database
         )
-        file_name = "%s_%s.idb" % (database.project, database.name)
+        file_name = "%s_%s_%s.idb" % (query.group, database.project, database.name)
         file_path = self.parent().server_file(file_name)
 
         # Read file from disk and sent it
@@ -206,6 +276,7 @@ class ServerClient(ClientSocket):
         self.send_packet(reply)
 
     def _handle_join_session(self, packet):
+        self._group = packet.group
         self._project = packet.project
         self._database = packet.database
         self._name = packet.name
@@ -231,11 +302,12 @@ class ServerClient(ClientSocket):
 
         # Send all missed events
         events = self.parent().storage.select_events(
-            self._project, self._database, packet.tick
+            self._group, self._project, self._database, packet.tick
         )
-        self._logger.debug("Sending %d missed events" % len(events))
+        self._logger.debug("Sending %d missed events..." % len(events))
         for event in events:
             self.send_packet(event)
+        self._logger.debug("Done sending %d missed events" % len(events))
 
     def _handle_leave_session(self, packet):
         # Inform others users that we are leaving
@@ -246,6 +318,7 @@ class ServerClient(ClientSocket):
         for user in self.parent().get_users(self):
             self.send_packet(LeaveSession(user.name))
 
+        self._group = None
         self._project = None
         self._database = None
         self._name = None
@@ -288,6 +361,11 @@ class Server(ServerSocket):
         self._storage.initialize()
 
         self._discovery = ClientsDiscovery(logger)
+        # A temporory lock to stop clients while updating other locks
+        self.client_lock = threading.Lock()
+        # A long term lock that stops breaking database updates when multiple
+        # clients are connected
+        self.db_update_lock = threading.Lock()
 
     @property
     def storage(self):
@@ -339,6 +417,11 @@ class Server(ServerSocket):
         for client in list(self._clients):
             client.disconnect(notify=False)
         self.disconnect()
+        try:
+            self.db_update_lock.release()
+        except RuntimeError:
+            # It might not actually be locked
+            pass
         return True
 
     def _accept(self, sock):
@@ -353,12 +436,31 @@ class Server(ServerSocket):
 
         sock.settimeout(0)  # No timeout
         sock.setblocking(0)  # No blocking
+
+        # If we already have at least one connection, lock the mutex that
+        # prevents database updates like renaming. Connecting clients will
+        # block until an existing blocking operation, like a porject rename, is
+        # completed
+        self.client_lock.acquire()
+        if len(self._clients) == 1:
+            self.db_update_lock.acquire()
         client.wrap_socket(sock)
         self._clients.append(client)
+        self.client_lock.release()
 
     def reject(self, client):
         """Called when a user disconnects."""
+
+        # Allow clients to update database again
+        self.client_lock.acquire()
         self._clients.remove(client)
+        if len(self._clients) <= 1:
+            try:
+                self.db_update_lock.release()
+            except RuntimeError:
+                pass
+
+        self.client_lock.release()
 
     def get_users(self, client, matches=None):
         """Get the other users on the same database."""

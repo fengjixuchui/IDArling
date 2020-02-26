@@ -12,7 +12,8 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 import datetime
 from functools import partial
-import logging
+import logging, time
+import binascii
 
 import ida_loader
 import ida_nalt
@@ -42,14 +43,17 @@ from PyQt5.QtWidgets import (
 )
 
 from ..shared.commands import (
-    CreateDatabase,
+    CreateGroup,
     CreateProject,
-    ListDatabases,
+    CreateDatabase,
+    RenameProject,
+    ListGroups,
     ListProjects,
+    ListDatabases,
     UpdateUserColor,
     UpdateUserName,
 )
-from ..shared.models import Database, Project
+from ..shared.models import Group, Project, Database
 
 
 class OpenDialog(QDialog):
@@ -58,6 +62,7 @@ class OpenDialog(QDialog):
     def __init__(self, plugin):
         super(OpenDialog, self).__init__()
         self._plugin = plugin
+        self._groups = None
         self._projects = None
         self._databases = None
 
@@ -65,7 +70,7 @@ class OpenDialog(QDialog):
         self.setWindowTitle("Open from Remote Server")
         icon_path = self._plugin.plugin_resource("download.png")
         self.setWindowIcon(QIcon(icon_path))
-        self.resize(900, 450)
+        self.resize(1400, 450)
 
         # Setup of the layout and widgets
         layout = QVBoxLayout(self)
@@ -73,22 +78,47 @@ class OpenDialog(QDialog):
         main_layout = QGridLayout(main)
         layout.addWidget(main)
 
+        # Groups - left layout
         self._left_side = QWidget(main)
         self._left_layout = QVBoxLayout(self._left_side)
-        self._projects_table = QTableWidget(0, 1, self._left_side)
+        self._groups_table = QTableWidget(0, 1, self._left_side)
+        self._groups_table.setHorizontalHeaderLabels(("Groups",))
+        self._groups_table.horizontalHeader().setSectionsClickable(False)
+        self._groups_table.horizontalHeader().setStretchLastSection(True)
+        self._groups_table.verticalHeader().setVisible(False)
+        self._groups_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._groups_table.setSelectionMode(QTableWidget.SingleSelection)
+        self._groups_table.itemSelectionChanged.connect(
+            self._group_clicked
+        )
+        self._left_layout.addWidget(self._groups_table)
+        main_layout.addWidget(self._left_side, 0, 0)
+        main_layout.setColumnStretch(0, 1)
+
+        # Projects - middle layout
+        self._middle_side = QWidget(main)
+        self._middle_layout = QVBoxLayout(self._middle_side)
+        self._projects_table = QTableWidget(0, 1, self._middle_side)
         self._projects_table.setHorizontalHeaderLabels(("Projects",))
         self._projects_table.horizontalHeader().setSectionsClickable(False)
         self._projects_table.horizontalHeader().setStretchLastSection(True)
         self._projects_table.verticalHeader().setVisible(False)
         self._projects_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._projects_table.setSelectionMode(QTableWidget.SingleSelection)
-        self._projects_table.itemSelectionChanged.connect(
+        self._projects_table.itemClicked.connect(
             self._project_clicked
         )
-        self._left_layout.addWidget(self._projects_table)
-        main_layout.addWidget(self._left_side, 0, 0)
-        main_layout.setColumnStretch(0, 1)
+        self._middle_layout.addWidget(self._projects_table)
+        main_layout.addWidget(self._middle_side, 0, 1)
+        main_layout.setColumnStretch(1, 1)
 
+        # Create a project button
+        self._rename_project_button = QPushButton("Rename Project", self._middle_side)
+        self._rename_project_button.setEnabled(False)
+        self._rename_project_button.clicked.connect(self._rename_project_button_clicked)
+        self._middle_layout.addWidget(self._rename_project_button)
+
+        # Databases - right layout
         right_side = QWidget(main)
         right_layout = QVBoxLayout(right_side)
         details_group = QGroupBox("Details", right_side)
@@ -104,9 +134,10 @@ class OpenDialog(QDialog):
         details_layout.addWidget(self._date_label, 1, 1)
         details_layout.setColumnStretch(1, 1)
         right_layout.addWidget(details_group)
-        main_layout.addWidget(right_side, 0, 1)
-        main_layout.setColumnStretch(1, 2)
+        main_layout.addWidget(right_side, 0, 2)
+        main_layout.setColumnStretch(2, 2)
 
+        # Databases table
         self._databases_group = QGroupBox("Databases", right_side)
         self._databases_layout = QVBoxLayout(self._databases_group)
         self._databases_table = QTableWidget(0, 3, self._databases_group)
@@ -127,29 +158,66 @@ class OpenDialog(QDialog):
         self._databases_layout.addWidget(self._databases_table)
         right_layout.addWidget(self._databases_group)
 
+        # General buttons - bottom right "stretched" layout
         buttons_widget = QWidget(self)
         buttons_layout = QHBoxLayout(buttons_widget)
         buttons_layout.addStretch()
+
+        # Open button
         self._accept_button = QPushButton("Open", buttons_widget)
         self._accept_button.setEnabled(False)
+        # self.accept is a QDialog virtual method
         self._accept_button.clicked.connect(self.accept)
+
+        # Cancel button
         cancel_button = QPushButton("Cancel", buttons_widget)
+        # self.reject is a QDialog virtual method
         cancel_button.clicked.connect(self.reject)
+
+        # Place buttons onto UI
         buttons_layout.addWidget(cancel_button)
         buttons_layout.addWidget(self._accept_button)
         layout.addWidget(buttons_widget)
 
+        # Ask the server for the list of groups
+        d = self._plugin.network.send_packet(ListGroups.Query())
+        d.add_callback(self._groups_listed)
+        d.add_errback(self._plugin.logger.exception)
+
+    def _groups_listed(self, reply):
+        """Called when the groups list is received."""
+        self._groups = sorted(reply.groups, key=lambda x: x.name) # sort groups by name
+        #self._groups = sorted(reply.groups, key=lambda x: x.date, reverse=True) # sort groups by reverse date
+        self._refresh_groups()
+
+    def _refresh_groups(self):
+        """Refreshes the groups table."""
+        self._groups_table.setRowCount(len(self._groups))
+        for i, group in enumerate(self._groups):
+            item = QTableWidgetItem(group.name)
+            item.setData(Qt.UserRole, group)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self._groups_table.setItem(i, 0, item)
+
+    def _group_clicked(self):
+        self._plugin.logger.debug("OpenDialog._group_clicked()")
+        """Called when a group item is clicked."""
+        group = self._groups_table.selectedItems()[0].data(Qt.UserRole)
+
         # Ask the server for the list of projects
-        d = self._plugin.network.send_packet(ListProjects.Query())
-        d.add_callback(self._projects_listed)
+        d = self._plugin.network.send_packet(ListProjects.Query(group.name))
+        d.add_callback(partial(self._projects_listed))
         d.add_errback(self._plugin.logger.exception)
 
     def _projects_listed(self, reply):
+        self._plugin.logger.debug("OpenDialog._projects_listed()")
         """Called when the projects list is received."""
-        self._projects = reply.projects
+        self._projects = sorted(reply.projects, key=lambda x: x.name) # sort project by name
+        #self._projects = sorted(reply.projects, key=lambda x: x.date, reverse=True) # sort project by reverse date
         self._refresh_projects()
 
     def _refresh_projects(self):
+        self._plugin.logger.debug("OpenDialog._refresh_projects()")
         """Refreshes the projects table."""
         self._projects_table.setRowCount(len(self._projects))
         for i, project in enumerate(self._projects):
@@ -160,20 +228,31 @@ class OpenDialog(QDialog):
 
     def _project_clicked(self):
         """Called when a project item is clicked."""
-        project = self._projects_table.selectedItems()[0].data(Qt.UserRole)
+        self._plugin.logger.debug("OpenDialog._project_clicked()")
+        if len(self._projects) == 0:
+            self._plugin.logger.info("No project to display yet 2")
+            return  # no project in the group yet
+        
+        group = self._groups_table.selectedItems()[0].data(Qt.UserRole)
+        project_items = self._projects_table.selectedItems()
+        if not project_items:
+            self._plugin.logger.info("No selected item 2")
+            return
+        project = project_items[0].data(Qt.UserRole)
         self._file_label.setText("<b>File:</b> %s" % str(project.file))
         self._hash_label.setText("<b>Hash:</b> %s" % str(project.hash))
         self._type_label.setText("<b>Type:</b> %s" % str(project.type))
         self._date_label.setText("<b>Date:</b> %s" % str(project.date))
 
         # Ask the server for the list of databases
-        d = self._plugin.network.send_packet(ListDatabases.Query(project.name))
+        d = self._plugin.network.send_packet(ListDatabases.Query(group.name, project.name))
         d.add_callback(partial(self._databases_listed))
         d.add_errback(self._plugin.logger.exception)
+        self._rename_project_button.setEnabled(True)
 
     def _databases_listed(self, reply):
         """Called when the databases list is received."""
-        self._databases = reply.databases
+        self._databases = self.sort_databases(reply.databases)
         self._refresh_databases()
 
     def _refresh_databases(self):
@@ -204,21 +283,57 @@ class OpenDialog(QDialog):
     def _database_double_clicked(self):
         self.accept()
 
+    def _rename_project_button_clicked(self, _):
+        current_project = self._projects_table.selectedItems()[0].data(Qt.UserRole).name
+        dialog = RenameProjectDialog(self._plugin, "Rename project", current_project)
+        dialog.accepted.connect(partial(self._rename_project_dialog_accepted, dialog))
+        dialog.exec_()
+
+    def _rename_project_dialog_accepted(self, dialog):
+        group = self._groups_table.selectedItems()[0].data(Qt.UserRole).name
+        old_name = self._projects_table.selectedItems()[0].data(Qt.UserRole).name
+        new_name = dialog.get_result()
+        self._plugin.logger.info("Request to rename to %s to %s in group: %s" % (old_name, new_name, group))
+        # Send the packet to the server with the new name
+        d = self._plugin.network.send_packet(RenameProject.Query(group, old_name, new_name))
+        d.add_callback(self._project_renamed)
+        d.add_errback(self._plugin.logger.exception)
+
+    def _project_renamed(self, reply):
+        self._renamed = reply.renamed
+        if self._renamed:
+            self._projects = self.sort_projects(reply.projects)
+            self._refresh_projects()
+        else:
+            self._plugin.logger.debug("Create project dialog")
+            QMessageBox.about(self, "IDArling Error", "Unable to rename.\n"
+                    "Likely more than one client connected?")
+
     def get_result(self):
         """Get the project and database selected by the user."""
+        group = self._groups_table.selectedItems()[0].data(Qt.UserRole)
         project = self._projects_table.selectedItems()[0].data(Qt.UserRole)
         database = self._databases_table.selectedItems()[0].data(Qt.UserRole)
-        return project, database
+        return group, project, database
 
+    # XXX - Make x.name configurable based on clicking on columns
+    def sort_projects(self, projects):
+        #return sorted(projects, key=lambda x: x.date, reverse=True) # sort project by reverse date
+        return sorted(projects, key=lambda x: x.name)
+
+    # XXX - Make x.date configurable based on clicking on columns
+    def sort_databases(self, databases):
+        return sorted(databases, key=lambda x: x.date, reverse=True) # sort databases by reverse date
 
 class SaveDialog(OpenDialog):
     """
-    This dialog is shown to user to select which remote database to save. We
-    extend the save dialog to reuse most of the UI setup code.
+    This save dialog is shown to user to select which remote database to save. We
+    extend the open dialog to reuse most of the UI setup code.
     """
 
     def __init__(self, plugin):
         super(SaveDialog, self).__init__(plugin)
+        self._group = None
         self._project = None
 
         # General setup of the dialog
@@ -229,10 +344,20 @@ class SaveDialog(OpenDialog):
         # Change the accept button text
         self._accept_button.setText("Save")
 
+        # Add a button to create a group
+        create_group_button = QPushButton("Create Group", self._left_side)
+        create_group_button.clicked.connect(self._create_group_clicked)
+        self._left_layout.addWidget(create_group_button)
+        
         # Add a button to create a project
-        create_project_button = QPushButton("Create Project", self._left_side)
-        create_project_button.clicked.connect(self._create_project_clicked)
-        self._left_layout.addWidget(create_project_button)
+        self._create_project_button = QPushButton(
+            "Create Project", self._middle_side
+        )
+        self._create_project_button.setEnabled(False)
+        self._create_project_button.clicked.connect(
+            self._create_project_clicked
+        )
+        self._middle_layout.addWidget(self._create_project_button)
 
         # Add a button to create a database
         self._create_database_button = QPushButton(
@@ -244,11 +369,66 @@ class SaveDialog(OpenDialog):
         )
         self._databases_layout.addWidget(self._create_database_button)
 
-    def _project_clicked(self):
-        super(SaveDialog, self)._project_clicked()
-        self._project = self._projects_table.selectedItems()[0].data(
+    def _group_clicked(self):
+        super(SaveDialog, self)._group_clicked()
+        self._group = self._groups_table.selectedItems()[0].data(
             Qt.UserRole
         )
+        self._create_project_button.setEnabled(True)
+
+    def _create_group_clicked(self):
+        dialog = CreateGroupDialog(self._plugin)
+        dialog.accepted.connect(partial(self._create_group_accepted, dialog))
+        dialog.exec_()
+
+    def _create_group_accepted(self, dialog):
+        """Called when the group creation dialog is accepted."""
+        name = dialog.get_result()
+        # Ensure we don't already have a group with that name
+        if any(group.name == name for group in self._groups):
+            failure = QMessageBox()
+            failure.setIcon(QMessageBox.Warning)
+            failure.setStandardButtons(QMessageBox.Ok)
+            failure.setText("A group with that name already exists!")
+            failure.setWindowTitle("New Group")
+            icon_path = self._plugin.plugin_resource("upload.png")
+            failure.setWindowIcon(QIcon(icon_path))
+            failure.exec_()
+            return
+
+        # Get all the information we need and sent it to the server
+        date_format = "%Y/%m/%d %H:%M"
+        date = datetime.datetime.now().strftime(date_format)
+        group = Group(name, date)
+        d = self._plugin.network.send_packet(CreateGroup.Query(group))
+        d.add_callback(partial(self._group_created, group))
+        d.add_errback(self._plugin.logger.exception)
+
+    def _group_created(self, group, _):
+        """Called when the create group reply is received."""
+        self._groups.append(group)
+        self._refresh_groups()
+        row = len(self._groups) - 1
+        self._groups_table.selectRow(row)
+        self._accept_button.setEnabled(False)
+
+    # XXX - not needed?
+    def _refresh_groups(self):
+        super(SaveDialog, self)._refresh_groups()
+        for row in range(self._groups_table.rowCount()):
+            item = self._groups_table.item(row, 0)
+            group = item.data(Qt.UserRole)
+            pass
+
+    def _project_clicked(self):
+        self._plugin.logger.debug("SaveDialog._project_clicked()")
+        super(SaveDialog, self)._project_clicked()
+        self._plugin.logger.debug("SaveDialog._project_clicked() continue")
+        project_items = self._projects_table.selectedItems()
+        if not project_items:
+            self._plugin.logger.info("No selected item 2")
+            return
+        self._project = project_items[0].data(Qt.UserRole)
         self._create_database_button.setEnabled(True)
 
     def _create_project_clicked(self):
@@ -259,8 +439,9 @@ class SaveDialog(OpenDialog):
     def _create_project_accepted(self, dialog):
         """Called when the project creation dialog is accepted."""
         name = dialog.get_result()
-
         # Ensure we don't already have a project with that name
+        # Note: 2 different groups can have two projects with the same name
+        # and it will effectively be 2 different projects
         if any(project.name == name for project in self._projects):
             failure = QMessageBox()
             failure.setIcon(QMessageBox.Warning)
@@ -273,12 +454,17 @@ class SaveDialog(OpenDialog):
             return
 
         # Get all the information we need and sent it to the server
-        hash = ida_nalt.retrieve_input_file_md5().lower()
+        hash = ida_nalt.retrieve_input_file_md5()
+        # Remove the trailing null byte, if exists
+        if hash.endswith(b'\x00'):
+          hash = hash[0:-1]
+        # This decode is safe, because we have an hash in hex format
+        hash = binascii.hexlify(hash).decode('utf-8')
         file = ida_nalt.get_root_filename()
-        type = ida_loader.get_file_type_name()
+        ftype = ida_loader.get_file_type_name()
         date_format = "%Y/%m/%d %H:%M"
         date = datetime.datetime.now().strftime(date_format)
-        project = Project(name, hash, file, type, date)
+        project = Project(self._group.name, name, hash, file, ftype, date)
         d = self._plugin.network.send_packet(CreateProject.Query(project))
         d.add_callback(partial(self._project_created, project))
         d.add_errback(self._plugin.logger.exception)
@@ -292,8 +478,19 @@ class SaveDialog(OpenDialog):
         self._accept_button.setEnabled(False)
 
     def _refresh_projects(self):
+        self._plugin.logger.debug("SaveDialog._refresh_projects()")
         super(SaveDialog, self)._refresh_projects()
-        hash = ida_nalt.retrieve_input_file_md5().lower()
+        self._plugin.logger.debug("SaveDialog._refresh_projects() continue")
+
+        if len(self._projects) == 0:
+            self._plugin.logger.info("No project to display yet 3")
+            return  # no project in the group yet
+
+        hash = ida_nalt.retrieve_input_file_md5()
+        if hash.endswith(b'\x00'):
+            hash = hash[0:-1]
+        # This decode is safe, because we have an hash in hex format
+        hash = binascii.hexlify(hash).decode('utf-8')
         for row in range(self._projects_table.rowCount()):
             item = self._projects_table.item(row, 0)
             project = item.data(Qt.UserRole)
@@ -327,7 +524,7 @@ class SaveDialog(OpenDialog):
         # Get all the information we need and sent it to the server
         date_format = "%Y/%m/%d %H:%M"
         date = datetime.datetime.now().strftime(date_format)
-        database = Database(self._project.name, name, date, -1)
+        database = Database(self._group.name, self._project.name, name, date, -1)
         d = self._plugin.network.send_packet(CreateDatabase.Query(database))
         d.add_callback(partial(self._database_created, database))
         d.add_errback(self._plugin.logger.exception)
@@ -347,16 +544,16 @@ class SaveDialog(OpenDialog):
                 item.setFlags(item.flags() | Qt.ItemIsEnabled)
 
 
-class CreateProjectDialog(QDialog):
-    """The dialog shown when an user wants to create a project."""
+class CreateGroupDialog(QDialog):
+    """The dialog shown when an user wants to create a group."""
 
     def __init__(self, plugin):
-        super(CreateProjectDialog, self).__init__()
+        super(CreateGroupDialog, self).__init__()
         self._plugin = plugin
 
         # General setup of the dialog
-        self._plugin.logger.debug("Create project dialog")
-        self.setWindowTitle("Create Project")
+        self._plugin.logger.debug("Create group dialog")
+        self.setWindowTitle("Create Group")
         icon_path = plugin.plugin_resource("upload.png")
         self.setWindowIcon(QIcon(icon_path))
         self.resize(100, 100)
@@ -364,7 +561,7 @@ class CreateProjectDialog(QDialog):
         # Set up the layout and widgets
         layout = QVBoxLayout(self)
 
-        self._nameLabel = QLabel("<b>Project Name</b>")
+        self._nameLabel = QLabel("<b>Group Name</b>")
         layout.addWidget(self._nameLabel)
         self._nameEdit = QLineEdit()
         self._nameEdit.setValidator(QRegExpValidator(QRegExp("[a-zA-Z0-9-]+")))
@@ -385,7 +582,19 @@ class CreateProjectDialog(QDialog):
         return self._nameEdit.text()
 
 
-class CreateDatabaseDialog(CreateProjectDialog):
+class CreateProjectDialog(CreateGroupDialog):
+    """The dialog shown when an user wants to create a project. We extend the
+    create project dialog to avoid duplicating the UI setup code.
+    """
+
+    def __init__(self, plugin):
+        super(CreateProjectDialog, self).__init__(plugin)
+        #self._plugin.logger.debug("Create project dialog")
+        self.setWindowTitle("Create Project")
+        self._nameLabel.setText("<b>Project Name</b>")
+
+
+class CreateDatabaseDialog(CreateGroupDialog):
     """
     The dialog shown when an user wants to create a database. We extend the
     create project dialog to avoid duplicating the UI setup code.
@@ -393,6 +602,7 @@ class CreateDatabaseDialog(CreateProjectDialog):
 
     def __init__(self, plugin):
         super(CreateDatabaseDialog, self).__init__(plugin)
+        #self._plugin.logger.debug("Create database dialog")
         self.setWindowTitle("Create Database")
         self._nameLabel.setText("<b>Database Name</b>")
 
@@ -521,32 +731,43 @@ class SettingsDialog(QDialog):
         top_layout = QHBoxLayout(top_widget)
 
         self._servers = list(self._plugin.config["servers"])
-        self._servers_table = QTableWidget(len(self._servers), 2, self)
+        self._servers_table = QTableWidget(len(self._servers), 3, self)
         top_layout.addWidget(self._servers_table)
         for i, server in enumerate(self._servers):
             # Server host and port
             item = QTableWidgetItem("%s:%d" % (server["host"], server["port"]))
             item.setData(Qt.UserRole, server)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-            if self._plugin.network.server == server:
-                item.setFlags((item.flags() & ~Qt.ItemIsSelectable))
+            # XXX - This prevented editing a server entry for your current 
+            # server because the row cannot be selected properly with 
+            # SingleSelection option selected
+            #if self._plugin.network.server == server:
+            #    item.setFlags((item.flags() & ~Qt.ItemIsSelectable))
             self._servers_table.setItem(i, 0, item)
 
             # Server has SSL enabled?
-            checkbox = QTableWidgetItem()
+            ssl_checkbox = QTableWidgetItem()
             state = Qt.Unchecked if server["no_ssl"] else Qt.Checked
-            checkbox.setCheckState(state)
-            checkbox.setFlags((checkbox.flags() & ~Qt.ItemIsEditable))
-            checkbox.setFlags((checkbox.flags() & ~Qt.ItemIsUserCheckable))
-            if self._plugin.network.server == server:
-                checkbox.setFlags((checkbox.flags() & ~Qt.ItemIsSelectable))
-            self._servers_table.setItem(i, 1, checkbox)
+            ssl_checkbox.setCheckState(state)
+            ssl_checkbox.setFlags((ssl_checkbox.flags() & ~Qt.ItemIsEditable))
+            ssl_checkbox.setFlags((ssl_checkbox.flags() & ~Qt.ItemIsUserCheckable))
+            self._servers_table.setItem(i, 1, ssl_checkbox)
 
-        self._servers_table.setHorizontalHeaderLabels(("Servers", ""))
+            # Auto-connect enabled?
+            auto_checkbox = QTableWidgetItem()
+            state = Qt.Unchecked if not server["auto_connect"] else Qt.Checked
+            auto_checkbox.setCheckState(state)
+            auto_checkbox.setFlags((auto_checkbox.flags() & ~Qt.ItemIsEditable))
+            auto_checkbox.setFlags((auto_checkbox.flags() & ~Qt.ItemIsUserCheckable))
+            self._servers_table.setItem(i, 2, auto_checkbox)
+
+        self._servers_table.setHorizontalHeaderLabels(("Servers", "SSL",
+                    "Auto"))
         horizontal_header = self._servers_table.horizontalHeader()
         horizontal_header.setSectionsClickable(False)
         horizontal_header.setSectionResizeMode(0, QHeaderView.Stretch)
         horizontal_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        horizontal_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self._servers_table.verticalHeader().setVisible(False)
         self._servers_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._servers_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -681,7 +902,11 @@ class SettingsDialog(QDialog):
         dialog.exec_()
 
     def _edit_button_clicked(self, _):
-        item = self._servers_table.selectedItems()[0]
+        selected = self._servers_table.selectedItems()
+        if len(selected) == 0:
+            self._plugin.logger.warning("No server selected")
+            return
+        item = selected[0]
         server = item.data(Qt.UserRole)
         dialog = ServerInfoDialog(self._plugin, "Edit server", server)
         dialog.accepted.connect(partial(self._edit_dialog_accepted, dialog))
@@ -808,6 +1033,43 @@ class SettingsDialog(QDialog):
 
         self._plugin.save_config()
 
+class RenameProjectDialog(QDialog):
+    """The dialog shown when an user wants to rename a project."""
+
+    def __init__(self, plugin, title, current_value, server=None):
+        super(RenameProjectDialog, self).__init__()
+        self._plugin = plugin
+
+        # General setup of the dialog
+        self._plugin.logger.debug("Showing rename project dialog")
+        self.setWindowTitle(title)
+        icon_path = plugin.plugin_resource("settings.png")
+        self.setWindowIcon(QIcon(icon_path))
+        self.resize(100, 100)
+
+        # Setup the layout and widgets
+        layout = QVBoxLayout(self)
+
+        self._rename_project_name_label = QLabel("<b>New Project Name</b>")
+        layout.addWidget(self._rename_project_name_label)
+        self._new_project_name = QLineEdit()
+        # Populate the field with the old name and already selected
+        self._new_project_name.setText(current_value)
+        self._new_project_name.setSelection(0, len(current_value))
+        layout.addWidget(self._new_project_name)
+
+        self._add_button = QPushButton("OK")
+        self._add_button.clicked.connect(self.accept)
+        down_side = QWidget(self)
+        buttons_layout = QHBoxLayout(down_side)
+        buttons_layout.addWidget(self._add_button)
+        self._cancel_button = QPushButton("Cancel")
+        self._cancel_button.clicked.connect(self.reject)
+        buttons_layout.addWidget(self._cancel_button)
+        layout.addWidget(down_side)
+
+    def get_result(self):
+        return self._new_project_name.text()
 
 class ServerInfoDialog(QDialog):
     """The dialog shown when an user creates or edits a server."""
@@ -841,11 +1103,15 @@ class ServerInfoDialog(QDialog):
         self._no_ssl_checkbox = QCheckBox("Disable SSL")
         layout.addWidget(self._no_ssl_checkbox)
 
+        self._auto_connect_checkbox = QCheckBox("Auto-connect on startup")
+        layout.addWidget(self._auto_connect_checkbox)
+
         # Set the form elements values if we have a base
         if server is not None:
             self._server_name.setText(server["host"])
             self._server_port.setText(str(server["port"]))
             self._no_ssl_checkbox.setChecked(server["no_ssl"])
+            self._auto_connect_checkbox.setChecked(server["auto_connect"])
 
         down_side = QWidget(self)
         buttons_layout = QHBoxLayout(down_side)
@@ -863,4 +1129,5 @@ class ServerInfoDialog(QDialog):
             "host": self._server_name.text() or "127.0.0.1",
             "port": int(self._server_port.text() or "31013"),
             "no_ssl": self._no_ssl_checkbox.isChecked(),
+            "auto_connect": self._auto_connect_checkbox.isChecked(),
         }

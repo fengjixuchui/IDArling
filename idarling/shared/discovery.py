@@ -46,7 +46,6 @@ class ClientsDiscovery(QObject):
         """Start the discovery process and broadcast the given information."""
         self._logger.debug("Starting clients discovery")
         self._info = "%s %d %s" % (host, port, ssl)
-
         # Create a datagram socket capable of broadcasting
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -67,25 +66,34 @@ class ClientsDiscovery(QObject):
         """Stop the discovery process."""
         self._logger.debug("Stopping clients discovery")
         self._read_notifier.setEnabled(False)
-        try:
-            self._socket.close()
-        except socket.error:
-            pass
+        if self._socket:
+            try:
+                self._socket.close()
+            except socket.error:
+                pass
         self._socket = None
         self._started = False
         self._timer.stop()
 
     def _send_request(self):
         """This function sends to discovery request packets."""
-        self._logger.trace("Sending discovery request")
+        # This is very verbose as it triggers every 1 sec so only enable when debugging
+        #self._logger.trace("Sending discovery request")
         request = DISCOVERY_REQUEST + " " + self._info
         request = request.encode("utf-8")
         while len(request):
             try:
-                sent = self._socket.sendto(request, ("<broadcast>", 31013))
+                self._socket.setblocking(0)
+                sent = self._socket.sendto(
+                    request, 0, ("<broadcast>", 31013)
+                )
                 request = request[sent:]
-            except socket.error:
-                self._logger.warning("Couldn't send discovery request")
+            except socket.error as e:
+                self._logger.warning("Couldn't send discovery request: {}".format(e))
+                # Force return, otherwise the while loop will halt IDA
+                # This is a temporary fix, and it's gonna yield the above
+                # warning every every n seconds..
+                return
 
     def _notify_read(self):
         """This function is called when a discovery reply is received."""

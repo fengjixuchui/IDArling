@@ -89,9 +89,12 @@ class ClientSocket(QObject):
         if not self._socket:
             return
 
-        self._logger.debug("Disconnected")
         if err:
-            self._logger.exception(err)
+            if isinstance(err, ConnectionRefusedError):
+                self._logger.error("Connection refused")
+            else:
+                self._logger.exception(err)
+        self._logger.debug("Disconnected")
         self._read_notifier.setEnabled(False)
         self._write_notifier.setEnabled(False)
         try:
@@ -160,7 +163,7 @@ class ClientSocket(QObject):
                     return False
 
             self._connected = True
-            self._logger.debug("Connected")
+            self._logger.info("Connected")
             return True
 
     def _notify_read(self):
@@ -237,6 +240,7 @@ class ClientSocket(QObject):
 
         if self._write_cursor >= len(self._write_buffer):
             if not self._outgoing:
+                self._write_notifier.setEnabled(False)
                 return  # No more packets to send
             self._write_packet = self._outgoing.popleft()
 
@@ -246,8 +250,8 @@ class ClientSocket(QObject):
                 line = line.encode("utf-8") + b"\n"
             except Exception as e:
                 msg = "Invalid packet being sent: %s" % self._write_packet
-                self._logger.warning(msg)
-                self._logger.exception(e)
+                self._logger.warning(msg + "\n")
+                self._logger.exception(str(e) + "\n")
                 return
 
             # Write the container's content

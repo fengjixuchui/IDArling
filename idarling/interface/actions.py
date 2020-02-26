@@ -56,7 +56,9 @@ class Action(object):
         action_name = self.__class__.__name__
 
         # Read and load the icon file
-        icon_data = str(open(self._icon, "rb").read())
+        icon_data_fd = open(self._icon, "rb")
+        icon_data = icon_data_fd.read()
+        icon_data_fd.close()
         self._icon_id = ida_kernwin.load_custom_icon(data=icon_data)
 
         # Create the action descriptor
@@ -171,7 +173,7 @@ class OpenActionHandler(ActionHandler):
     _DIALOG = OpenDialog
 
     def _dialog_accepted(self, dialog):
-        project, database = dialog.get_result()
+        group, project, database = dialog.get_result()
 
         # Create the download progress dialog
         text = "Downloading database from server, please wait..."
@@ -185,7 +187,7 @@ class OpenActionHandler(ActionHandler):
         progress.setWindowIcon(QIcon(icon_path))
 
         # Send a packet to download the file
-        packet = DownloadFile.Query(project.name, database.name)
+        packet = DownloadFile.Query(group.name, project.name, database.name)
         callback = partial(self._on_progress, progress)
 
         def set_download_callback(reply):
@@ -193,11 +195,11 @@ class OpenActionHandler(ActionHandler):
 
         d = self._plugin.network.send_packet(packet)
         d.add_initback(set_download_callback)
-        d.add_callback(partial(self._file_downloaded, database, progress))
+        d.add_callback(partial(self._file_downloaded, group, database, progress))
         d.add_errback(self._plugin.logger.exception)
         progress.show()
 
-    def _file_downloaded(self, database, progress, reply):
+    def _file_downloaded(self, group, database, progress, reply):
         """Called when the file has been downloaded."""
         progress.close()
 
@@ -205,7 +207,7 @@ class OpenActionHandler(ActionHandler):
         app_path = QCoreApplication.applicationFilePath()
         app_name = QFileInfo(app_path).fileName()
         file_ext = "i64" if "64" in app_name else "idb"
-        file_name = "%s_%s.%s" % (database.project, database.name, file_ext)
+        file_name = "%s_%s_%s.%s" % (group.name, database.project, database.name, file_ext)
         file_path = self._plugin.user_resource("files", file_name)
 
         # Write the file to disk
@@ -347,10 +349,11 @@ class SaveActionHandler(ActionHandler):
         return super(SaveActionHandler, self).update(ctx)
 
     def _dialog_accepted(self, dialog):
-        project, database = dialog.get_result()
+        group, project, database = dialog.get_result()
+        self._plugin.core.group = group.name
         self._plugin.core.project = project.name
         self._plugin.core.database = database.name
 
         # Create the packet that will hold the file
-        packet = UpdateFile.Query(project.name, database.name)
+        packet = UpdateFile.Query(group.name, project.name, database.name)
         SaveActionHandler.upload_file(self._plugin, packet)

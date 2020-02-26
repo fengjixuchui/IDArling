@@ -51,7 +51,7 @@ class Core(Module):
         idaname = "ida64" if "64" in app_name else "ida"
         if sys.platform == "win32":
             dllname, dlltype = idaname + ".dll", ctypes.windll
-        elif sys.platform == "linux2":
+        elif sys.platform in ["linux", "linux2"]:
             dllname, dlltype = "lib" + idaname + ".so", ctypes.cdll
         elif sys.platform == "darwin":
             dllname, dlltype = "lib" + idaname + ".dylib", ctypes.cdll
@@ -62,6 +62,7 @@ class Core(Module):
 
     def __init__(self, plugin):
         super(Core, self).__init__(plugin)
+        self._group = None
         self._project = None
         self._database = None
         self._tick = 0
@@ -76,6 +77,15 @@ class Core(Module):
         self._ui_hooks_core = None
         self._view_hooks_core = None
         self._hooked = False
+
+    @property
+    def group(self):
+        return self._group
+
+    @group.setter
+    def group(self, group):
+        self._group = group
+        self.save_netnode()
 
     @property
     def project(self):
@@ -146,19 +156,20 @@ class Core(Module):
 
         class IDPHooksCore(ida_idp.IDP_Hooks):
             def ev_get_bg_color(self, color, ea):
-                core._plugin.logger.trace("Get bg color hook")
+                #core._plugin.logger.trace("Get bg color hook")
                 value = core._plugin.interface.painter.get_bg_color(ea)
                 if value is not None:
                     ctypes.c_uint.from_address(long(color)).value = value
                     return 1
                 return 0
 
-            def auto_queue_empty(self, _):
-                core._plugin.logger.debug("Auto queue empty hook")
+            def ev_auto_queue_empty(self, arg):
+                #core._plugin.logger.debug("Auto queue empty hook")
                 if ida_auto.get_auto_state() == ida_auto.AU_NONE:
                     client = core._plugin.network.client
                     if client:
                         client.call_events()
+                return super(self.__class__, self).ev_auto_queue_empty(arg)
 
         self._idp_hooks_core = IDPHooksCore()
         self._idp_hooks_core.hook()
@@ -168,6 +179,8 @@ class Core(Module):
                 core._plugin.logger.trace("Ready to run hook")
                 core.load_netnode()
                 core.join_session()
+                # XXX - calling this function triggered lots of errors
+                # when moving to Python 3
                 core._plugin.interface.painter.ready_to_run()
 
             def get_ea_hint(self, ea):
@@ -183,7 +196,7 @@ class Core(Module):
 
         class ViewHooksCore(ida_kernwin.View_Hooks):
             def view_loc_changed(self, view, now, was):
-                core._plugin.logger.trace("View loc changed hook")
+                #core._plugin.logger.trace("View loc changed hook")
                 if now.plce.toea() != was.plce.toea():
                     name = core._plugin.config["user"]["name"]
                     color = core._plugin.config["user"]["color"]
@@ -233,35 +246,41 @@ class Core(Module):
         """
         node = ida_netnode.netnode(Core.NETNODE_NAME, 0, True)
 
-        self._project = node.hashval("project") or None
-        self._database = node.hashval("database") or None
-        self._tick = int(node.hashval("tick") or "0")
+        self._group = node.hashstr("group") or None
+        self._project = node.hashstr("project") or None
+        self._database = node.hashstr("database") or None
+        self._tick = int(node.hashstr("tick") or "0")
 
         self._plugin.logger.debug(
-            "Loaded netnode: project=%s, database=%s, tick=%d"
-            % (self._project, self._database, self._tick)
+            "Loaded netnode: group=%s, project=%s, database=%s, tick=%d"
+            % (self._group, self._project, self._database, self._tick)
         )
 
     def save_netnode(self):
         """Save data into our custom netnode."""
         node = ida_netnode.netnode(Core.NETNODE_NAME, 0, True)
 
+        # node.hashset does not work anymore with direct string
+        # use of hashet_buf instead
+        # (see https://github.com/idapython/src/blob/master/swig/netnode.i#L162)
+        if self._group:
+            node.hashset_buf("group", str(self._group))
         if self._project:
-            node.hashset("project", str(self._project))
+            node.hashset_buf("project", str(self._project))
         if self._database:
-            node.hashset("database", str(self._database))
+            node.hashset_buf("database", str(self._database))
         if self._tick:
-            node.hashset("tick", str(self._tick))
+            node.hashset_buf("tick", str(self._tick))
 
         self._plugin.logger.debug(
-            "Saved netnode: project=%s, database=%s, tick=%d"
-            % (self._project, self._database, self._tick)
+            "Saved netnode: group=%s, project=%s, database=%s, tick=%d"
+            % (self._group, self._project, self._database, self._tick)
         )
 
     def join_session(self):
         """Join the collaborative session."""
         self._plugin.logger.debug("Joining session")
-        if self._project and self._database:
+        if self._group and self._project and self._database:
 
             def databases_listed(reply):
                 if any(d.name == self._database for d in reply.databases):
@@ -275,6 +294,7 @@ class Core(Module):
                 ea = ida_kernwin.get_screen_ea()
                 self._plugin.network.send_packet(
                     JoinSession(
+                        self._group,
                         self._project,
                         self._database,
                         self._tick,
@@ -287,7 +307,7 @@ class Core(Module):
                 self._users.clear()
 
             d = self._plugin.network.send_packet(
-                ListDatabases.Query(self._project)
+                ListDatabases.Query(self._group, self._project)
             )
             if d:
                 d.add_callback(databases_listed)
@@ -296,7 +316,7 @@ class Core(Module):
     def leave_session(self):
         """Leave the collaborative session."""
         self._plugin.logger.debug("Leaving session")
-        if self._project and self._database:
+        if self._group and self._project and self._database:
             name = self._plugin.config["user"]["name"]
             self._plugin.network.send_packet(LeaveSession(name))
             self._users.clear()

@@ -109,7 +109,7 @@ class StatusWidget(QWidget):
 
     def refresh(self):
         """Called to update the widget when the network state has changed."""
-        self._plugin.logger.trace("Refreshing the status bar widget")
+        #self._plugin.logger.trace("Refreshing the status bar widget")
 
         # Get the corresponding color, text and icon
         if self._plugin.network.connected:

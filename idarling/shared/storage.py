@@ -13,7 +13,7 @@
 import json
 import sqlite3
 
-from .models import Database, Project
+from .models import Group, Project, Database
 from .packets import Default, DefaultEvent
 
 
@@ -31,39 +31,67 @@ class Storage(object):
     def initialize(self):
         """Create all the default tables."""
         self._create(
-            "projects",
+            "groups",
             [
                 "name text not null",
-                "hash text not null",
-                "file text not null",
-                "type text not null",
                 "date text not null",
                 "primary key (name)",
             ],
         )
         self._create(
+            "projects",
+            [
+                "group_name text not null",
+                "name text not null",
+                "hash text not null",
+                "file text not null",
+                "type text not null",
+                "date text not null",
+                "foreign key(group_name) references groups(name)",
+                "primary key (group_name, name)",
+            ],
+        )
+        self._create(
             "databases",
             [
+                "group_name text not null",
                 "project text not null",
                 "name text not null",
                 "date text not null",
-                "foreign key(project) references projects(name)",
-                "primary key(project, name)",
+                "foreign key(group_name) references groups(name)",
+                "foreign key(group_name, project) references projects(group_name, name)",
+                "primary key(group_name, project, name)",
             ],
         )
         self._create(
             "events",
             [
+                "group_name text not null",
                 "project text not null",
                 "database text not null",
                 "tick integer not null",
                 "dict text not null",
-                "foreign key(project) references projects(name)",
-                "foreign key(project, database)"
-                "     references databases(project, name)",
-                "primary key(project, database, tick)",
+                "foreign key(group_name) references groups(name)",
+                "foreign key(group_name, project) references projects(group_name, name)",
+                "foreign key(group_name, project, database)"
+                "     references databases(group_name, project, name)",
+                "primary key(group_name, project, database, tick)",
             ],
         )
+
+    def insert_group(self, group):
+        """Insert a new group into the database."""
+        self._insert("groups", Default.attrs(group.__dict__))
+
+    def select_group(self, name):
+        """Select the group with the given name."""
+        objects = self.select_groups(name, 1)
+        return objects[0] if objects else None
+
+    def select_groups(self, name=None, limit=None):
+        """Select the groups with the given name."""
+        results = self._select("groups", {"name": name}, limit)
+        return [Group(**result) for result in results]
 
     def insert_project(self, project):
         """Insert a new project into the database."""
@@ -74,10 +102,24 @@ class Storage(object):
         objects = self.select_projects(name, 1)
         return objects[0] if objects else None
 
-    def select_projects(self, name=None, limit=None):
-        """Select the projects with the given name."""
-        results = self._select("projects", {"name": name}, limit)
+    def select_projects(self, group=None, name=None, limit=None):
+        """Select the projects with the given group and name."""
+        results = self._select(
+            "projects", {"group_name": group, "name": name}, limit
+        )
         return [Project(**result) for result in results]
+
+    def update_project_name(self, group=None, old_name=None, new_name=None, limit=None):
+        """Update a project with the given new name."""
+        self._update("projects", "name", new_name, {"group_name": group, "name": old_name}, limit)
+
+    def update_database_project(self, group=None, old_name=None, new_name=None, limit=None):
+        """Update a project with the given new name."""
+        self._update("databases", "project", new_name, {"group_name": group, "project": old_name}, limit)
+
+    def update_events_project(self, group=None, old_name=None, new_name=None, limit=None):
+        """Update a project with the given new name."""
+        self._update("events", "project", new_name, {"group_name": group, "project": old_name}, limit)
 
     def insert_database(self, database):
         """Insert a new database into the database."""
@@ -85,15 +127,15 @@ class Storage(object):
         attrs.pop("tick")
         self._insert("databases", attrs)
 
-    def select_database(self, project, name):
+    def select_database(self, group, project, name):
         """Select the database with the given project and name."""
-        objects = self.select_databases(project, name, 1)
+        objects = self.select_databases(group, project, name, 1)
         return objects[0] if objects else None
 
-    def select_databases(self, project=None, name=None, limit=None):
+    def select_databases(self, group=None, project=None, name=None, limit=None):
         """Select the databases with the given project and name."""
         results = self._select(
-            "databases", {"project": project, "name": name}, limit
+            "databases", {"group_name": group, "project": project, "name": name}, limit
         )
         return [Database(**result) for result in results]
 
@@ -103,6 +145,7 @@ class Storage(object):
         self._insert(
             "events",
             {
+                "group_name": client.group,
                 "project": client.project,
                 "database": client.database,
                 "tick": event.tick,
@@ -110,12 +153,12 @@ class Storage(object):
             },
         )
 
-    def select_events(self, project, database, tick):
+    def select_events(self, group, project, database, tick):
         """Get all events sent after the given tick count."""
         c = self._conn.cursor()
-        sql = "select * from events where project = ? and database = ?"
+        sql = "select * from events where group_name = ? and project = ? and database = ?"
         sql += "and tick > ? order by tick asc;"
-        c.execute(sql, [project, database, tick])
+        c.execute(sql, [group, project, database, tick])
         events = []
         for result in c.fetchall():
             dct = json.loads(result["dict"])
@@ -123,12 +166,12 @@ class Storage(object):
             events.append(DefaultEvent.new(dct))
         return events
 
-    def last_tick(self, project, database):
+    def last_tick(self, group, project, database):
         """Get the last tick of the specified project and database."""
         c = self._conn.cursor()
-        sql = "select tick from events where project = ? and database = ? "
+        sql = "select tick from events where group_name = ? and project = ? and database = ? "
         sql += "order by tick desc limit 1;"
-        c.execute(sql, [project, database])
+        c.execute(sql, [group, project, database])
         result = c.fetchone()
         return result["tick"] if result else 0
 
@@ -148,6 +191,21 @@ class Storage(object):
             sql = (sql + " where {}").format(" and ".join(cols))
         sql += " limit {};".format(limit) if limit else ";"
         c.execute(sql, list(fields.values()))
+        return c.fetchall()
+
+    def _update(self, table, field, new_value, search_fields, limit=None):
+        """Update the field in a table matching the given search fields."""
+        c = self._conn.cursor()
+        sql = "update {} set {} = ?".format(table, field)
+        search_fields = {key: val for key, val in search_fields.items() if val}
+        if len(search_fields):
+            cols = ["{} = ?".format(col) for col in search_fields.keys()]
+            sql = (sql + " where {}").format(" and ".join(cols))
+        sql += " limit {};".format(limit) if limit else ";"
+        conditions = [new_value] + list(search_fields.values())
+        #print(sql)
+        #print(conditions)
+        c.execute(sql, conditions)
         return c.fetchall()
 
     def _insert(self, table, fields):
